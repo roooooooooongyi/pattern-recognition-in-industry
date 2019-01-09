@@ -1,0 +1,285 @@
+import numpy as np 
+import pandas as pd
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import seaborn as sns
+from statsmodels.sandbox.stats import runs
+from sklearn.cluster import MeanShift,estimate_bandwidth
+from sklearn.cluster import KMeans
+
+def hampel_filter(Ia, k ,t0):
+    y = Ia.copy()
+    n = len(y)
+    L = 1.4826
+    for i in np.arange(k,n-k):
+        y0 = np.median(y[(i-k):(i+k)])
+        S0 = L * np.median(np.abs(y[(i-k):(i+k)]) - y0)
+        if np.abs(y[i]-y0) > t0*S0:
+            y[i] = y0
+    out = y.reset_index(drop=True)
+    return out
+
+# 取前差分值最大的前80个点
+def cal_diff(thre,area_var,Ia_ham,need_Ia_diff_pos):
+    """
+    输入：
+    thre: 取前多少个差分
+    area_var: 计算方差的半径大小
+    need_Ia_diff_pos: True 表示计算差分，False表示计算反向差分
+    """
+#     thre = 80 #40
+#     area_var = 5*60
+#     need_Ia_diff_pos = False
+    Ia_diff1 = pd.Series(np.diff(Ia_ham))
+    if need_Ia_diff_pos:
+        Ia_diff1_sort = Ia_diff1.sort_values(ascending=False).reset_index(drop=True)
+        thre_limit = Ia_diff1_sort[thre-1]
+#         _,_,p=sns.kdeplot(Ia_diff1)
+        Ia_diff1_great = Ia_diff1[Ia_diff1>thre_limit]
+    else:
+        Ia_diff1_sort = Ia_diff1.sort_values(ascending=True).reset_index(drop=True)
+        thre_limit = Ia_diff1_sort[thre-1]
+        Ia_diff1_great = Ia_diff1[Ia_diff1<thre_limit]
+    mutation_point = Ia_diff1_great.index.values 
+
+    var_c_list_all = []
+    var_c_list = []
+    mutation_list = []
+    for no, cur_mutation_point in enumerate(mutation_point):
+        left_boundary = max(0, cur_mutation_point-area_var)  # 太靠左边可能会有错误 因为样本半径内不足
+        right_boundary = min(len(Ia_ham), cur_mutation_point+area_var)  #太靠右边可能会有错误 因为样本半径内不足
+        left_data = Ia_ham[left_boundary:cur_mutation_point]
+        right_data = Ia_ham[cur_mutation_point:right_boundary]   
+        left_var = np.var(left_data)
+        right_var = np.var(right_data)
+        # mean
+        left_mean = np.mean(left_data)
+        right_mean = np.mean(right_data)
+        # 判断
+        if need_Ia_diff_pos:
+            if left_var == 0:
+                print("no=%s:左边的方差为0，出现异常" % no)
+                left_var = 1e-4
+                var_c = right_var/left_var
+            var_c = right_var/left_var
+            var_c_list_all.append(var_c)
+            if left_mean<right_mean:  # 在var_c 较大的基础上 再增加一个 均值的判断条件
+                var_c_list.append(var_c)
+                mutation_list.append(cur_mutation_point)
+        else:
+            if right_var == 0:
+                print("no=%s:右边的方差为0，出现异常" % no)
+                right_var = 1e-4
+                var_c = left_var/right_var
+            var_c = left_var/right_var
+    #         print("location",cur_mutation_point)
+    #         print("left_var", left_var)
+    #         print("right_var", right_var)
+    #         print("var_c",left_var/right_var)
+            var_c_list_all.append(var_c)
+            if left_mean>right_mean:  # 在var_c 较大的基础上 再增加一个 均值的判断条件
+                var_c_list.append(var_c)
+                mutation_list.append(cur_mutation_point)
+        var_c_np = np.array(var_c_list)
+        mutation_np = np.array(mutation_list)
+
+    score_var_c = pd.DataFrame({"mutation_point":mutation_np, "var_c":var_c_np}).sort_values(by="var_c",ascending=False).reset_index(drop=True)
+    score_var_c_all = pd.DataFrame({"all_var_c":var_c_list_all,"mutation_point":mutation_point})
+    if need_Ia_diff_pos:
+        left_mutation = score_var_c.copy()
+        return left_mutation
+    else:
+        right_mutation = score_var_c.copy()
+        return right_mutation
+
+def filter_var_c(left_mutation, right_mutation, Ia_ham,need_picture=False):
+    #筛选策略1：var_c   
+    left_mutation = cal_diff(80,300,Ia_ham,True)
+    right_mutation = cal_diff(80,300,Ia_ham,False)
+    if need_picture==True:
+        fig = plt.figure(figsize=(13,6))
+        plt.plot(Ia_ham, c='grey')
+        index_var_left = left_mutation['mutation_point']
+        plt.scatter(index_var_left,Ia_ham[index_var_left],marker='^',c='red',linewidths=3)
+        index_var_right = right_mutation['mutation_point']
+        plt.scatter(index_var_right,Ia_ham[index_var_right],marker='v',c='blue',linewidths=3)
+        plt.grid(True)
+    return left_mutation,right_mutation
+
+def filter_window(K,left_mutation,right_mutation,need_picture=False):
+    """
+    筛选策略2：窗口过滤冗余点,取窗口内var_c最大原则
+    """
+    window = right_mutation['mutation_point']//K
+    right_mutation['window'] = window
+    right_mutation = right_mutation.sort_values(by=['window','var_c'],ascending=[True,False])
+    right_mutation_filter = pd.DataFrame(right_mutation.groupby(['window']).first()).reset_index(drop=True)
+    window = left_mutation['mutation_point']//K
+    left_mutation['window'] = window
+    left_mutation = left_mutation.sort_values(by=['window','var_c'],ascending=[True,False])
+    left_mutation_filter = pd.DataFrame(left_mutation.groupby(['window']).first()).reset_index(drop=True)
+    if need_picture==True:
+        fig = plt.figure(figsize=(13,6))
+        plt.plot(Ia_ham, c='grey')
+        index_var_left = left_mutation_filter['mutation_point']
+        plt.scatter(index_var_left,Ia_ham[index_var_left],marker='^',c='red',linewidths=3)
+        index_var_right = right_mutation_filter['mutation_point']
+        plt.scatter(index_var_right,Ia_ham[index_var_right],marker='v',c='blue',linewidths=3)
+        plt.grid(True)
+    return left_mutation_filter,right_mutation_filter
+
+def filter_unique(Ia,left_mutation_filter,right_mutation_filter,need_picture=True):
+    """
+    筛选策略3：确保两点之间的唯一性
+    """
+    #（1）游程，左右边界集合
+    left_mutation_filter["code"] = 1
+    right_mutation_filter["code"] = 0
+    all_mutation_filter = pd.concat([left_mutation_filter, right_mutation_filter], axis=0).sort_values(by="mutation_point", ascending=True).reset_index(drop=True)
+    all_mutation_filter['Ia_raw'] = Ia.values[all_mutation_filter["mutation_point"]]
+    code = all_mutation_filter["code"].values
+    mutation = all_mutation_filter['mutation_point'].values
+    v1 = mutation.copy()
+    code_diff = np.diff(code,n=1)
+    # 处理游程不等于1的点集合
+    state_run = runs.Runs(code)
+    run_df = pd.DataFrame({'idx':state_run.runstart[:-1],'len':state_run.runs})
+    # mutation_delete = set(range(len(all_mutation_filter)))&set(run_df.idx)
+    tmp_Ia_raw = all_mutation_filter["Ia_raw"]
+    mutation_loc_unique = []
+    idx_unique = []
+    for i in range(len(run_df)):
+        start = run_df.loc[i,'idx']
+        end = run_df.loc[i,'idx']+run_df.loc[i,'len']
+        idxmin_ = tmp_Ia_raw[start:end].idxmin()
+        mutation_loc_unique.append(all_mutation_filter.loc[idxmin_,"mutation_point"])
+    #     idx_unique.append(i)
+    mutation_loc_unique = pd.DataFrame({"mutation_point":mutation_loc_unique})  # 确保为左右端点一一对应关系
+    all_mutation_unique = all_mutation_filter.merge(mutation_loc_unique,on='mutation_point',how='inner')
+    # all_mutation_unique
+    left_mutation_unique = all_mutation_unique.loc[all_mutation_unique["code"]==1].reset_index(drop=True)
+    right_mutation_unique = all_mutation_unique.loc[all_mutation_unique["code"]==0].reset_index(drop=True)
+    left_unique_bound = left_mutation_unique['mutation_point']
+    right_unique_bound = right_mutation_unique['mutation_point']
+    if need_picture:
+        plt.rcParams['axes.facecolor'] = 'whitesmoke'
+        fig = plt.figure(figsize=(13,6))
+        plt.plot(Ia, c='grey',zorder=-5)
+        plt.scatter(left_unique_bound,Ia[left_unique_bound],marker='^',c='teal',linewidths=4,zorder=1)
+        plt.vlines(x=left_unique_bound,ymin = Ia.min(),ymax=Ia.max(),linestyles='dashed',colors="teal")
+        plt.grid(True,zorder=-6)
+        plt.scatter(right_unique_bound,Ia[right_unique_bound],marker='v',c='burlywood',linewidths=4,zorder=2)
+        plt.vlines(x=right_unique_bound,ymin = Ia.min(),ymax=Ia.max(),linestyles='dashed',colors="burlywood")
+        plt.title("Results",size=18)
+    return left_mutation_unique,right_mutation_unique,left_unique_bound,right_unique_bound
+
+def omit_outlier(mutation_unique_table):
+    """
+    删除工作电流较大的“状态点” 返回的是正常电流范围内的“状态点”
+    """
+    Ia_raw_table_left = mutation_unique_table.loc[:,"Ia_raw"]
+    data = Ia_raw_table_left.sort_values(ascending=True)
+    if data[0]==0:  # 基本全为0的情况不筛选  可以根据需要筛选
+        return data.reset_index(drop=False)
+    elif np.max(data)/(np.min(data)+0.01) >20: #20 2.69 0.1  # 有些情况不需要筛选状态点
+        print(np.max(data)/(np.min(data)+0.0001))
+        print(np.max(data))
+        uplimit = np.percentile(data,75)
+        downlimit = np.percentile(data,25)
+        limit = uplimit + (uplimit-downlimit)
+        out = data[data<limit].reset_index(drop=False)
+        return out
+    else:
+        return data.reset_index(drop=False)
+    
+def get_standby(mutation_unique,Ia_raw_table_standby):
+    """
+    输入：mutation_unique是包含状态点位置，电流信息的dataframe
+         Ia_raw_table_standby是状态点对应的原始电流series
+    输出：获得正常范围内的“状态点”对应的位置
+    """
+    index_standby = Ia_raw_table_standby["index"]
+    mutation_unique_better = mutation_unique.loc[index_standby,:].sort_values(by="mutation_point").reset_index(drop=True)
+    unique_bound_better = mutation_unique_better["mutation_point"]
+    return unique_bound_better
+
+def side_identity(Ia,left_unique_bound_better,right_unique_bound_better):
+    """
+    保证左右端点个数一样多
+    """
+    left_unique_bound_len = left_unique_bound_better.copy()
+    right_unique_bound_len = right_unique_bound_better.copy()
+    len_left = len(left_unique_bound_len)
+    len_right = len(right_unique_bound_len)
+    len_Ia = len(Ia)
+    if len_left<len_right:
+        left_unique_bound_len = pd.Series(np.insert(np.array(left_unique_bound_len),0,0)) # 补充起始点
+    elif len_left>len_right:
+        right_unique_bound_len = right_unique_bound_len.append(pd.Series([len(Ia)]),ignore_index=True)  # 补充末位点
+    else:
+        if left_unique_bound_len[0]>right_unique_bound_len[0]:  # 左端点起始点大于右端点起始点
+            left_unique_bound_len = np.insert(np.array(left_unique_bound_len),0,0)
+            right_unique_bound_len = np.append(np.array(right_unique_bound_len),len(Ia))
+    return left_unique_bound_len,right_unique_bound_len
+
+def get_results(left_unique_bound_len,right_unique_bound_len):
+    wave_len = right_unique_bound_len-left_unique_bound_len
+    state_table = pd.DataFrame({"start_idx":left_unique_bound_len,"end_idx":right_unique_bound_len,"wave_len":wave_len})
+    return state_table
+
+def plot_results(Ia,left_unique_bound_len,right_unique_bound_len):
+    plt.rcParams['axes.facecolor'] = 'whitesmoke'
+    plt.close('all')
+    fig = plt.figure(figsize=(13,6),facecolor="w",edgecolor="w")
+    plt.plot(Ia,color='lightsteelblue',zorder=1)
+    rounds = min(len(left_unique_bound_len),len(right_unique_bound_len))
+    for idx in range(rounds):
+        start = left_unique_bound_len[idx]
+        end = right_unique_bound_len[idx]
+        cur_Ia = Ia[start:end]
+        plt.plot(cur_Ia, alpha=0.9,zorder=2)
+        arrow_idx = (start+end)/2
+        plt.annotate('%s' % (idx+1), xy=(arrow_idx, max(Ia)*0.87), xytext=(arrow_idx-2000, max(Ia)),size=12,
+          arrowprops=dict(facecolor='lightgray', shrink=0.01),zorder=2 ,horizontalalignment='left',verticalalignment='bottom')
+    plt.grid(True, zorder=-6)
+    plt.title("Results by Simple Method",size=18)
+
+    
+def main(k=500,num_diff=300,num_var=80):
+    K=2*k
+    data_all = pd.read_csv('/home/wrj/cal_num_python/train/焊机.csv',encoding='gb2312')# k=1
+    data_all = data_all.rename(columns={'A相电流(Ia)':'实际电流'})
+    data = data_all.dropna().reset_index()
+    Ia = data['实际电流']
+    Ia_ham = hampel_filter(Ia, k, 3)  #k是一个超参数 表示左右多少的点计算滤波 
+
+    left_mutation = cal_diff(num_diff,num_var,Ia_ham,True)
+    right_mutation = cal_diff(num_diff,num_var,Ia_ham,False)
+    left_mutation,right_mutation = filter_var_c(left_mutation,right_mutation,Ia_ham,False)
+    left_mutation_filter,right_mutation_filter = filter_window(K,left_mutation,right_mutation,False)
+    left_mutation_unique,right_mutation_unique,left_unique_bound,right_unique_bound = filter_unique(Ia,left_mutation_filter,right_mutation_filter,need_picture=False)
+    Ia_raw_table_left_standby = omit_outlier(left_mutation_unique)
+    Ia_raw_table_right_standby = omit_outlier(right_mutation_unique)
+    left_unique_bound_better = get_standby(left_mutation_unique,Ia_raw_table_left_standby)
+    right_unique_bound_better = get_standby(right_mutation_unique,Ia_raw_table_right_standby)
+    left_unique_bound_len,right_unique_bound_len = side_identity(Ia,left_unique_bound_better,right_unique_bound_better)
+    state_table = get_results(left_unique_bound_len,right_unique_bound_len)
+    plot_results(Ia,left_unique_bound_len,right_unique_bound_len)
+    
+    return state_table
+    
+if __name__=="__main__()":
+    # 简单波形
+    data_all = pd.read_csv('/home/wrj/cal_num_python/mcj_data_0918.csv',encoding='gb2312')
+    # data_all = pd.read_csv('/home/wrj/cal_num_python/train/摇臂钻床8D.csv',encoding='gb2312')
+#     data_all = pd.read_csv('/home/wrj/cal_num_python/train/2018-12-21摇臂钻床8D2018112700036.csv',encoding='gb2312')
+    # data_all = pd.read_csv('/home/wrj/cal_num_python/train/2018-12-21摇臂钻床7D2018112700037.csv',encoding='gb2312')
+    # data_all = pd.read_csv('/home/wrj/cal_num_python/train/立式加工中心.csv',encoding='gb2312')
+
+    # 复杂波形
+    # data_all = pd.read_csv('/home/wrj/cal_num_python/train/卧式车床4D.csv',encoding='gb2312') # 加了一个条件 if np.min(data)==0 不处理
+    # data_all = pd.read_csv('/home/wrj/cal_num_python/train/焊机3071_D2018112700047.csv',encoding='gb2312')
+    # data_all = pd.read_csv('/home/wrj/cal_num_python/train/焊机.csv',encoding='gb2312')# k=1
+
+    state_table = main(k=500)
+    print(state_table)
